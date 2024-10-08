@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/googlecodelabs/tools/claat/fetch/drive/auth"
+	"github.com/googlecodelabs/tools/claat/nodes"
 	"github.com/googlecodelabs/tools/claat/parser"
 	"github.com/googlecodelabs/tools/claat/types"
 	"github.com/googlecodelabs/tools/claat/util"
@@ -45,6 +46,9 @@ const (
 
 	// driveAPI is a base URL for Drive API
 	driveAPI = "https://www.googleapis.com/drive/v3"
+
+	// Minimum image size in bytes for extension detection.
+	minImageSize = 11
 )
 
 // TODO: create an enum for use with "nometa" for readability's sake
@@ -64,8 +68,9 @@ type resource struct {
 // and modified timestamp fields.
 type codelab struct {
 	*types.Codelab
-	Typ srcType   //  source type
-	Mod time.Time // last modified timestamp
+	Typ  srcType           //  source type
+	Mod  time.Time         // last modified timestamp
+	Imgs map[string]string // Slurped local image paths
 }
 
 type MemoryFetcher struct {
@@ -109,6 +114,7 @@ type Fetcher struct {
 	roundTripper http.RoundTripper
 }
 
+// NewFetcher creates an instance of Fetcher.
 func NewFetcher(at string, pm map[string]bool, rt http.RoundTripper) (*Fetcher, error) {
 	return &Fetcher{
 		authHelper:   nil,
@@ -124,8 +130,8 @@ func NewFetcher(at string, pm map[string]bool, rt http.RoundTripper) (*Fetcher, 
 // It returns parsed codelab and its source type.
 //
 // The function will also fetch and parse fragments included
-// with types.ImportNode.
-func (f *Fetcher) SlurpCodelab(src string) (*codelab, error) {
+// with nodes.ImportNode.
+func (f *Fetcher) SlurpCodelab(src string, output string) (*codelab, error) {
 	_, err := os.Stat(src)
 	// Only setup oauth if this source is not a local file.
 	if os.IsNotExist(err) {
@@ -149,20 +155,41 @@ func (f *Fetcher) SlurpCodelab(src string) (*codelab, error) {
 	if err != nil {
 		return nil, err
 	}
+	images := make(map[string]string)
+	dir := codelabDir(output, &clab.Meta)
+	imgDir := filepath.Join(dir, util.ImgDirname)
+	if !isStdout(output) {
+		// download or copy codelab assets to disk, and rewrite image URLs
+		var nodes []nodes.Node
+		for _, step := range clab.Steps {
+			nodes = append(nodes, step.Content.Nodes...)
+		}
+		err := f.SlurpImages(src, imgDir, nodes, images)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	// fetch imports and parse them as fragments
-	var imports []*types.ImportNode
+	var imports []*nodes.ImportNode
 	for _, st := range clab.Steps {
-		imports = append(imports, types.ImportNodes(st.Content.Nodes)...)
+		imports = append(imports, nodes.ImportNodes(st.Content.Nodes)...)
 	}
 	ch := make(chan error, len(imports))
 	defer close(ch)
 	for _, imp := range imports {
-		go func(n *types.ImportNode) {
+		go func(n *nodes.ImportNode) {
 			frag, err := f.slurpFragment(n.URL)
 			if err != nil {
 				ch <- fmt.Errorf("%s: %v", n.URL, err)
 				return
+			}
+			if !isStdout(output) {
+				// download or copy codelab assets to disk, and rewrite image URLs
+				err = f.SlurpImages(gdocID(n.URL), imgDir, frag, images)
+				if err != nil {
+					return
+				}
 			}
 			n.Content.Nodes = frag
 			ch <- nil
@@ -178,14 +205,15 @@ func (f *Fetcher) SlurpCodelab(src string) (*codelab, error) {
 		Codelab: clab,
 		Typ:     res.typ,
 		Mod:     res.mod,
+		Imgs:    images,
 	}
 	return v, nil
 }
 
-func (f *Fetcher) SlurpImages(src, dir string, steps []*types.Step) (map[string]string, error) {
+func (f *Fetcher) SlurpImages(src, dir string, n []nodes.Node, images map[string]string) error {
 	// make sure img dir exists
 	if err := os.MkdirAll(dir, 0755); err != nil {
-		return nil, err
+		return err
 	}
 
 	type res struct {
@@ -196,87 +224,96 @@ func (f *Fetcher) SlurpImages(src, dir string, steps []*types.Step) (map[string]
 	ch := make(chan *res, 100)
 	defer close(ch)
 	var count int
-	for _, st := range steps {
-		nodes := types.ImageNodes(st.Content.Nodes)
-		count += len(nodes)
-		for _, n := range nodes {
-			go func(n *types.ImageNode) {
-				url := n.Src
-				file, err := f.slurpBytes(src, dir, url)
-				if err == nil {
-					n.Src = filepath.Join(util.ImgDirname, file)
-				}
-				ch <- &res{url, file, err}
-			}(n)
-		}
+	imageNodes := nodes.ImageNodes(n)
+	count += len(imageNodes)
+	for _, imageNode := range imageNodes {
+		go func(imageNode *nodes.ImageNode) {
+			url := imageNode.Src
+			file, err := f.slurpBytes(src, dir, url, imageNode.Bytes)
+			if err == nil {
+				imageNode.Src = filepath.Join(util.ImgDirname, file)
+			}
+			ch <- &res{url, file, err}
+		}(imageNode)
 	}
-
-	imap := make(map[string]string, count)
 	var errStr string
 	for i := 0; i < count; i++ {
 		r := <-ch
-		imap[r.file] = r.url
+		images[r.file] = r.url
 		if r.err != nil {
 			errStr += fmt.Sprintf("%s => %s: %v\n", r.url, r.file, r.err)
 		}
 	}
 	if len(errStr) > 0 {
-		return nil, errors.New(errStr)
+		return errors.New(errStr)
 	}
 
-	return imap, nil
+	return nil
 }
 
-func (f *Fetcher) slurpBytes(codelabSrc, dir, imgURL string) (string, error) {
-	// images can be local in Markdown cases or remote.
+func (f *Fetcher) slurpBytes(codelabSrc, dir, imgURL string, imgBytes []byte) (string, error) {
+	// images can be data URLs, local in Markdown cases or remote.
 	// Only proceed a simple copy on local reference.
 	var b []byte
 	var ext string
-	u, err := url.Parse(imgURL)
-	if err != nil {
-		return "", err
-	}
+	var err error
 
-	// If the codelab source is being downloaded from the network, then we should interpret
-	// the image URL in the same way.
-	srcUrl, err := url.Parse(codelabSrc)
-	if err == nil && srcUrl.Host != "" {
-		u = srcUrl.ResolveReference(u)
-	}
-
-	if u.Host == "" {
-		if imgURL, err = restrictPathToParent(imgURL, filepath.Dir(codelabSrc)); err != nil {
+	if len(imgBytes) > 0 {
+		// Slurp bytes from image URL data.
+		b = imgBytes
+		if ext, err = imgExtFromBytes(b); err != nil {
+			return "", fmt.Errorf("Error reading image type: %v", err)
+		}
+	} else {
+		// Slurp bytes from local or remote URL.
+		u, err := url.Parse(imgURL)
+		if err != nil {
 			return "", err
 		}
-		b, err = ioutil.ReadFile(imgURL)
-		ext = filepath.Ext(imgURL)
-	} else {
-		b, err = f.slurpRemoteBytes(u.String(), 5)
-		if string(b[6:10]) == "JFIF" {
-			ext = ".jpeg"
-		} else if string(b[0:3]) == "GIF" {
-			ext = ".gif"
+
+		// If the codelab source is being downloaded from the network, then we should interpret
+		// the image URL in the same way.
+		srcURL, err := url.Parse(codelabSrc)
+		if err == nil && srcURL.Host != "" {
+			u = srcURL.ResolveReference(u)
+		}
+
+		if u.Host == "" {
+			if imgURL, err = restrictPathToParent(imgURL, filepath.Dir(codelabSrc)); err != nil {
+				return "", err
+			}
+			if b, err = ioutil.ReadFile(imgURL); err != nil {
+				return "", err
+			}
+			ext = filepath.Ext(imgURL)
 		} else {
-			ext = ".png"
+			if b, err = f.slurpRemoteBytes(u.String(), 5); err != nil {
+				return "", fmt.Errorf("Error downloading image at %s: %v", u.String(), err)
+			}
+			if ext, err = imgExtFromBytes(b); err != nil {
+				return "", fmt.Errorf("Error reading image type at %s: %v", u.String(), err)
+			}
 		}
 	}
-	if err != nil {
-		return "", err
-	}
 
+	// Generate image file from slurped bytes.
 	crc := crc64.Checksum(b, f.crcTable)
 	file := fmt.Sprintf("%x%s", crc, ext)
 	dst := filepath.Join(dir, file)
 	return file, ioutil.WriteFile(dst, b, 0644)
 }
 
-func (f *Fetcher) slurpFragment(url string) ([]types.Node, error) {
+func (f *Fetcher) slurpFragment(url string) ([]nodes.Node, error) {
 	res, err := f.fetch(url)
 	if err != nil {
 		return nil, err
 	}
 	defer res.body.Close()
-	return parser.ParseFragment(string(res.typ), res.body)
+
+	opts := *parser.NewOptions()
+	opts.PassMetadata = f.passMetadata
+
+	return parser.ParseFragment(string(res.typ), res.body, opts)
 }
 
 // fetch retrieves codelab doc either from local disk
@@ -455,7 +492,10 @@ func gdocID(url string) string {
 }
 
 func gdocExportURL(id string) string {
-	return fmt.Sprintf("%s/files/%s/export?mimeType=text/html", driveAPI, id)
+	q := url.Values{
+		"mimeType": {"text/html"},
+	}
+	return fmt.Sprintf("%s/files/%s/export?%s", driveAPI, id, q.Encode())
 }
 
 // restrictPathToParent will ensure that assetPath is in parent.
@@ -472,4 +512,30 @@ func restrictPathToParent(assetPath, parent string) (string, error) {
 		return "", fmt.Errorf("%s isn't a subdirectory of %s", assetPath, parent)
 	}
 	return assetPath, nil
+}
+
+// isStdout reports whether filename is stdout.
+func isStdout(filename string) bool {
+	const stdout = "-"
+	return filename == stdout
+}
+
+// codelabDir returns codelab root directory.
+// The base argument is codelab parent directory.
+func codelabDir(base string, m *types.Meta) string {
+	return filepath.Join(base, m.ID)
+}
+
+func imgExtFromBytes(b []byte) (string, error) {
+	if len(b) < minImageSize {
+		return "", fmt.Errorf("error parsing image - response \"%s\" is too small (< %d bytes)", b, minImageSize)
+	}
+	ext := ".png"
+	switch {
+	case string(b[6:10]) == "JFIF":
+		ext = ".jpeg"
+	case string(b[0:3]) == "GIF":
+		ext = ".gif"
+	}
+	return ext, nil
 }

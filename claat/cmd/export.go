@@ -102,7 +102,7 @@ func ExportCodelab(src string, rt http.RoundTripper, opts CmdExportOptions) (*ty
 	if err != nil {
 		return nil, err
 	}
-	clab, err := f.SlurpCodelab(src)
+	clab, err := f.SlurpCodelab(src, opts.Output)
 	if err != nil {
 		return nil, err
 	}
@@ -111,25 +111,19 @@ func ExportCodelab(src string, rt http.RoundTripper, opts CmdExportOptions) (*ty
 	lastmod := types.ContextTime(clab.Mod)
 	clab.Meta.Source = src
 	meta := &clab.Meta
-	ctx := &types.Context{
+
+	dir := opts.Output // output dir or stdout
+	if !isStdout(dir) {
+		dir = codelabDir(dir, meta)
+	}
+	// write codelab and its metadata to disk
+	return meta, writeCodelab(dir, clab.Codelab, opts.ExtraVars, &types.Context{
 		Env:     opts.Expenv,
 		Format:  opts.Tmplout,
 		Prefix:  opts.Prefix,
 		MainGA:  opts.GlobalGA,
 		Updated: &lastmod,
-	}
-
-	dir := opts.Output // output dir or stdout
-	if !isStdout(dir) {
-		dir = codelabDir(dir, meta)
-		// download or copy codelab assets to disk, and rewrite image URLs
-		mdir := filepath.Join(dir, util.ImgDirname)
-		if _, err := f.SlurpImages(src, mdir, clab.Steps); err != nil {
-			return nil, err
-		}
-	}
-	// write codelab and its metadata to disk
-	return meta, writeCodelab(dir, clab.Codelab, opts.ExtraVars, ctx)
+	})
 }
 
 func ExportCodelabMemory(src io.ReadCloser, w io.Writer, opts CmdExportOptions) (*types.Meta, error) {
@@ -164,6 +158,7 @@ func writeCodelabWriter(w io.Writer, clab *types.Codelab, extraVars map[string]s
 	}{Context: render.Context{
 		Env:      ctx.Env,
 		Prefix:   ctx.Prefix,
+		Format:   ctx.Format,
 		GlobalGA: ctx.MainGA,
 		Updated:  time.Time(*ctx.Updated).Format(time.RFC3339),
 		Meta:     &clab.Meta,
@@ -206,6 +201,7 @@ func writeCodelab(dir string, clab *types.Codelab, extraVars map[string]string, 
 	}{Context: render.Context{
 		Env:      ctx.Env,
 		Prefix:   ctx.Prefix,
+		Format:   ctx.Format,
 		GlobalGA: ctx.MainGA,
 		Updated:  time.Time(*ctx.Updated).Format(time.RFC3339),
 		Meta:     &clab.Meta,
@@ -265,10 +261,4 @@ func writeMeta(path string, cm *types.ContextMeta) error {
 	}
 	b = append(b, '\n')
 	return ioutil.WriteFile(path, b, 0644)
-}
-
-// codelabDir returns codelab root directory.
-// The base argument is codelab parent directory.
-func codelabDir(base string, m *types.Meta) string {
-	return filepath.Join(base, m.ID)
 }
